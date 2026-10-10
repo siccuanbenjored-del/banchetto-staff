@@ -1,0 +1,332 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Banchetto Staff Scanner</title>
+
+  <script src="https://unpkg.com/html5-qrcode"></script>
+
+  <style>
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      padding: 20px;
+      background: #101713;
+      color: #f4f7f4;
+      font-family: Arial, sans-serif;
+    }
+
+    main { max-width: 620px; margin: auto; }
+
+    h1 { color: #9be3b0; }
+
+    .panel {
+      background: #1b2720;
+      border: 1px solid #34483a;
+      border-radius: 14px;
+      padding: 16px;
+      margin: 16px 0;
+    }
+
+    input, button {
+      width: 100%;
+      padding: 13px;
+      margin: 7px 0;
+      border-radius: 8px;
+      font-size: 16px;
+    }
+
+    input {
+      background: #0e1511;
+      color: white;
+      border: 1px solid #526456;
+    }
+
+    button {
+      border: 0;
+      background: #a7e8b7;
+      color: #142219;
+      font-weight: bold;
+      cursor: pointer;
+    }
+
+    button.secondary { background: #34483a; color: white; }
+    button.warning { background: #f4c47a; color: #241b0d; }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+
+    #reader { width: 100%; overflow: hidden; }
+    #message { white-space: pre-wrap; overflow-wrap: anywhere; color: #c9e8d0; }
+    .muted { color: #b7c6ba; }
+    .hidden { display: none; }
+  </style>
+</head>
+
+<body>
+<main>
+  <h1>Banchetto Staff</h1>
+  <p class="muted">QR Scanner · Order Lookup · Payment · Claiming</p>
+
+  <section class="panel" id="loginPanel">
+    <h2>Staff Login</h2>
+    <label for="pin">Staff PIN</label>
+    <input id="pin" type="password" inputmode="numeric"
+      autocomplete="current-password" placeholder="Enter staff PIN">
+    <button id="loginButton">Sign In</button>
+  </section>
+
+  <section class="panel hidden" id="workPanel">
+    <h2>QR Scanner</h2>
+    <button id="startButton">Open Camera</button>
+    <button id="stopButton" class="secondary">Stop Camera</button>
+    <div id="reader"></div>
+
+    <hr>
+
+    <h2>Manual Lookup</h2>
+    <label for="orderInput">Order ID or complete QR content</label>
+    <input id="orderInput" placeholder="Example: B1234567890">
+    <button id="lookupButton">Look Up Order</button>
+    <button id="logoutButton" class="secondary">Log Out</button>
+  </section>
+
+  <section class="panel hidden" id="orderPanel">
+    <h2>Order Details</h2>
+    <div id="orderDetails"></div>
+    <button id="paidButton">Mark as PAID</button>
+    <button id="claimedButton" class="warning">Mark as CLAIMED</button>
+    <button id="clearButton" class="secondary">Clear Order</button>
+  </section>
+
+  <p id="message" role="status">Sign in to begin.</p>
+</main>
+
+<script>
+  // Replace this with your real Netlify Function URL after deployment.
+  const API_URL =
+    'https://YOUR-NETLIFY-SITE.netlify.app/.netlify/functions/api';
+
+  let staffPin = '';
+  let currentOrder = null;
+  let scanner = null;
+  let busy = false;
+
+  const $ = id => document.getElementById(id);
+
+  function showMessage(text) {
+    $('message').textContent = text;
+  }
+
+  async function apiRequest(data) {
+    if (API_URL.includes('YOUR-NETLIFY-SITE')) {
+      throw new Error('Configure API_URL with your Netlify Function URL.');
+    }
+
+    const response = await fetch(API_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...data, pin: data.pin || staffPin })
+    });
+
+    const result = await response.json();
+
+    if (!response.ok || !result.success) {
+      throw new Error(result.error || 'API request failed.');
+    }
+
+    return result;
+  }
+
+  async function login() {
+    const pin = $('pin').value.trim();
+    if (!pin) return showMessage('Enter your staff PIN.');
+
+    $('loginButton').disabled = true;
+    showMessage('Checking staff PIN...');
+
+    try {
+      await apiRequest({ action: 'login', pin });
+      staffPin = pin;
+
+      $('loginPanel').classList.add('hidden');
+      $('workPanel').classList.remove('hidden');
+      $('pin').value = '';
+
+      showMessage('Authorized. Ready to scan or look up an order.');
+    } catch (error) {
+      staffPin = '';
+      showMessage(error.message);
+    } finally {
+      $('loginButton').disabled = false;
+    }
+  }
+
+  async function startCamera() {
+    if (!staffPin) return showMessage('Sign in first.');
+    if (scanner) await stopCamera();
+
+    if (!window.Html5Qrcode) {
+      return showMessage('QR library failed to load. Check your internet connection.');
+    }
+
+    try {
+      scanner = new Html5Qrcode('reader');
+      const cameras = await Html5Qrcode.getCameras();
+
+      if (!cameras.length) throw new Error('No camera detected.');
+
+      await scanner.start(
+        cameras[0].id,
+        { fps: 10, qrbox: { width: 240, height: 240 } },
+        async decodedText => {
+          if (busy) return;
+          busy = true;
+          $('orderInput').value = decodedText;
+          await stopCamera();
+          await lookupOrder(decodedText);
+          busy = false;
+        },
+        () => {}
+      );
+
+      showMessage('Camera opened. Point it at the order QR code.');
+    } catch (error) {
+      await stopCamera();
+      showMessage('Camera error: ' + (error.message || error));
+    }
+  }
+
+  async function stopCamera() {
+    if (!scanner) return;
+
+    const oldScanner = scanner;
+    scanner = null;
+
+    try {
+      if (oldScanner.isScanning) await oldScanner.stop();
+      await oldScanner.clear();
+    } catch (error) {
+      console.warn('Scanner cleanup:', error);
+    }
+  }
+
+  async function lookupOrder(input) {
+    if (!staffPin) return showMessage('Sign in first.');
+
+    showMessage('Looking up order...');
+
+    try {
+      const result = await apiRequest({ action: 'lookup', input });
+      currentOrder = result.order;
+      renderOrder();
+      showMessage('Order found.');
+    } catch (error) {
+      currentOrder = null;
+      $('orderPanel').classList.add('hidden');
+      showMessage(error.message);
+    }
+  }
+
+  function renderOrder() {
+    const o = currentOrder;
+    if (!o) return;
+
+    $('orderDetails').replaceChildren();
+
+    const fields = [
+      ['Order ID', o.orderId],
+      ['Customer', o.customerName],
+      ['School / Section', o.section],
+      ['Items', o.items],
+      ['Total', '₱' + Number(o.total).toFixed(2)],
+      ['Payment', o.paymentStatus],
+      ['Order Status', o.orderStatus]
+    ];
+
+    fields.forEach(([label, value]) => {
+      const p = document.createElement('p');
+      const strong = document.createElement('strong');
+      strong.textContent = label + ': ';
+      p.append(strong, document.createTextNode(String(value ?? '')));
+      $('orderDetails').appendChild(p);
+    });
+
+    $('paidButton').disabled =
+      o.paymentStatus === 'PAID' || o.orderStatus === 'CLAIMED';
+
+    $('claimedButton').disabled =
+      o.paymentStatus !== 'PAID' || o.orderStatus === 'CLAIMED';
+
+    $('orderPanel').classList.remove('hidden');
+  }
+
+  async function updateStatus(statusAction) {
+    if (!currentOrder || !currentOrder.token) {
+      return showMessage('Order token missing. Look up the order again.');
+    }
+
+    const promptText = statusAction === 'PAID'
+      ? 'Confirm cash payment was received?'
+      : 'Confirm this order was handed to the customer?';
+
+    if (!confirm(promptText)) return;
+
+    showMessage('Updating order...');
+
+    try {
+      await apiRequest({
+        action: 'update',
+        orderId: currentOrder.orderId,
+        token: currentOrder.token,
+        statusAction
+      });
+
+      await lookupOrder(currentOrder.orderId);
+      showMessage('Order updated.');
+    } catch (error) {
+      showMessage(error.message);
+    }
+  }
+
+  function clearOrder() {
+    currentOrder = null;
+    $('orderInput').value = '';
+    $('orderPanel').classList.add('hidden');
+    showMessage('Ready for the next order.');
+  }
+
+  async function logout() {
+    await stopCamera();
+    staffPin = '';
+    currentOrder = null;
+    $('workPanel').classList.add('hidden');
+    $('orderPanel').classList.add('hidden');
+    $('loginPanel').classList.remove('hidden');
+    showMessage('Logged out.');
+  }
+
+  $('loginButton').addEventListener('click', login);
+  $('pin').addEventListener('keydown', e => {
+    if (e.key === 'Enter') login();
+  });
+  $('startButton').addEventListener('click', startCamera);
+  $('stopButton').addEventListener('click', stopCamera);
+  $('lookupButton').addEventListener('click', () => {
+    lookupOrder($('orderInput').value.trim());
+  });
+  $('orderInput').addEventListener('keydown', e => {
+    if (e.key === 'Enter') lookupOrder($('orderInput').value.trim());
+  });
+  $('paidButton').addEventListener('click', () => updateStatus('PAID'));
+  $('claimedButton').addEventListener('click', () => updateStatus('CLAIMED'));
+  $('clearButton').addEventListener('click', clearOrder);
+  $('logoutButton').addEventListener('click', logout);
+
+  window.addEventListener('pagehide', () => {
+    if (scanner && scanner.isScanning) scanner.stop();
+  });
+</script>
+</body>
+</html>
